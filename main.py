@@ -27,6 +27,18 @@ VK_SHIFT = 0x10
 VK_DELETE = 0x2E
 VK_ESCAPE = 0x1B
 
+def resource_path(relative_path):
+    """
+    Lấy đường dẫn tuyệt đối đến resource, dùng cho cả khi chạy script và khi đóng gói exe.
+    """
+    try:
+        # PyInstaller tạo biến _MEIPASS khi chạy exe
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 def find_vietnamese_font(preferred_fonts=None):
     """
     Tìm font hỗ trợ tiếng Việt trên hệ thống.
@@ -155,9 +167,11 @@ class PygameScreenProtector:
     def load_background_image(self):
         """Tải background image"""
         try:
-            if os.path.exists("wallpaper.jpg"):
+            # Sử dụng resource_path để lấy đúng đường dẫn khi build exe
+            img_path = resource_path("wallpaper.jpg")
+            if os.path.exists(img_path):
                 # Tải và resize image
-                pil_image = Image.open("wallpaper.jpg")
+                pil_image = Image.open(img_path)
                 pil_image = pil_image.resize((self.width, self.height), Image.Resampling.LANCZOS)
                 
                 # Chuyển sang Pygame surface
@@ -166,10 +180,10 @@ class PygameScreenProtector:
                 data = pil_image.tobytes()
                 
                 pygame_image = pygame.image.fromstring(data, size, mode)
-                print("✅ Đã tải background image: wallpaper.jpg")
+                print(f"✅ Đã tải background image: {img_path}")
                 return pygame_image
             else:
-                print("⚠️ Không tìm thấy wallpaper.jpg, sử dụng gradient")
+                print(f"⚠️ Không tìm thấy {img_path}, sử dụng gradient")
                 return None
         except Exception as e:
             print(f"❌ Lỗi tải background: {e}")
@@ -378,6 +392,10 @@ class PygameScreenProtector:
     
     def handle_keydown(self, event):
         """Xử lý phím nhấn"""
+        # Chỉ xử lý nhập mật khẩu khi ô mật khẩu đang hiển thị
+        if not self.show_password:
+            return
+            
         if event.key == pygame.K_RETURN:
             self.check_password()
         elif event.key == pygame.K_BACKSPACE:
@@ -525,6 +543,10 @@ class PygameScreenProtector:
     def on_key_press(self, key):
         """Xử lý khi nhấn phím"""
         try:
+            # Chỉ cho phép nhập mật khẩu khi ô mật khẩu đang hiển thị
+            if not self.show_password:
+                return False
+
             # Chặn các phím tắt hệ thống nguy hiểm
             if self.is_dangerous_key_combination(key):
                 print(f"🚫 Chặn phím tắt hệ thống: {key}")
