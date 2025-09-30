@@ -11,6 +11,13 @@ import ctypes
 from ctypes import wintypes
 from PIL import Image
 
+# Thêm import cho video
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
 # Windows API constants
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
@@ -30,14 +37,44 @@ VK_ESCAPE = 0x1B
 def resource_path(relative_path):
     """
     Lấy đường dẫn tuyệt đối đến resource, dùng cho cả khi chạy script và khi đóng gói exe.
+    Ưu tiên thứ tự:
+    1) Thư mục tạm của PyInstaller (_MEIPASS)
+    2) Thư mục chứa executable (khi đóng gói)
+    3) Thư mục làm việc hiện tại
     """
+    candidates = []
     try:
-        # PyInstaller tạo biến _MEIPASS khi chạy exe
-        base_path = sys._MEIPASS
+        base_meipass = getattr(sys, "_MEIPASS", None)
+        if base_meipass:
+            candidates.append(os.path.join(base_meipass, relative_path))
     except Exception:
-        base_path = os.path.abspath(".")
+        pass
 
-    return os.path.join(base_path, relative_path)
+    try:
+        # Thư mục của executable hoặc script
+        app_dir = os.path.dirname(getattr(sys, "executable", sys.argv[0]))
+        if app_dir:
+            candidates.append(os.path.join(os.path.abspath(app_dir), relative_path))
+    except Exception:
+        pass
+
+    # Thư mục làm việc hiện tại
+    candidates.append(os.path.join(os.path.abspath("."), relative_path))
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    # Trả về path ở thư mục làm việc như fallback cuối
+    return os.path.join(os.path.abspath("."), relative_path)
+
+def find_default_wallpaper_path():
+    """Tìm đường dẫn ảnh wallpaper mặc định ở nhiều vị trí hợp lý khi build exe."""
+    names = ["wallpaper.jpg", "wallpaper.jpeg", "wallpaper.png"]
+    for name in names:
+        p = resource_path(name)
+        if os.path.exists(p):
+            return p
+    return None
 
 def find_vietnamese_font(preferred_fonts=None):
     """
@@ -75,12 +112,36 @@ def find_vietnamese_font(preferred_fonts=None):
     return None
 
 class PygameScreenProtector:
-    def __init__(self, custom_message="", temp_password=None):
+    def __init__(self, custom_message="", temp_password=None, custom_bg_path=None, target_screen=None):
         pygame.init()
         
-        # Thiết lập màn hình fullscreen
-        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-        self.width, self.height = self.screen.get_size()
+        # Thiết lập cửa sổ không viền phủ toàn bộ virtual desktop (tất cả màn hình)
+        vx, vy, vw, vh = self.get_virtual_desktop_rect()
+        # Danh sách monitor với toạ độ tương đối trong virtual desktop
+        self.monitors = self.enumerate_monitors(vx, vy, vw, vh)
+        self.target_screen = target_screen  # 1-based index từ tham số dòng lệnh
+        # Xác định phạm vi cửa sổ theo lựa chọn -scr
+        if isinstance(self.target_screen, int) and 1 <= self.target_screen <= len(self.monitors):
+            sel = self.monitors[self.target_screen - 1]
+            win_x, win_y, win_w, win_h = sel["abs"]
+            window_rel_x, window_rel_y = sel["rel"][0], sel["rel"][1]
+            self.active_monitors = [sel]
+        else:
+            win_x, win_y, win_w, win_h = vx, vy, vw, vh
+            window_rel_x, window_rel_y = 0, 0
+            self.active_monitors = self.monitors
+        # Lưu vị trí cửa sổ trong hệ toạ độ virtual để quy đổi
+        self.window_vx, self.window_vy = win_x, win_y
+        self.window_rel_x, self.window_rel_y = window_rel_x, window_rel_y
+        try:
+            os.environ["SDL_VIDEO_WINDOW_POS"] = f"{win_x},{win_y}"
+        except Exception:
+            pass
+        self.screen = pygame.display.set_mode((int(win_w), int(win_h)), pygame.NOFRAME)
+        self.width, self.height = int(win_w), int(win_h)
+        # Ẩn icon khỏi taskbar và Alt-Tab
+        self.hide_from_taskbar()
+        self.set_window_topmost_and_place(win_x, win_y, win_w, win_h)
         
         # Thiết lập transparency cho cửa sổ
         self.set_window_transparency()
@@ -146,9 +207,42 @@ class PygameScreenProtector:
         self.start_keyboard_hook()
         self.start_system_monitor()
         
-        # Tải background image
-        self.background_image = self.load_background_image()
-        
+        # Tải background (ảnh hoặc video)
+        self.background_type = None  # "image", "video", hoặc None
+        self.background_image = None
+        self.video_cap = None
+        self.video_frame = None
+        self.video_fps = 30
+        self.video_last_time = 0
+        self.video_path = None
+        # Per-monitor assets (khi người dùng cung cấp nhiều background)
+        self.monitor_assets = []  # [{type, image, video_cap, video_frame, fps, last_time, path}]
+
+        if custom_bg_path:
+            # Cho phép danh sách nhiều đường dẫn, phân tách bằng dấu phẩy
+            bg_list = [p.strip() for p in custom_bg_path.split(',') if p.strip()]
+            if len(bg_list) > 1:
+                self.init_per_monitor_backgrounds(bg_list)
+            elif len(bg_list) == 1 and os.path.exists(bg_list[0]):
+                single_path = bg_list[0]
+                ext = os.path.splitext(single_path)[1].lower()
+                if ext in [".mp4", ".avi", ".mov", ".mkv", ".wmv"] and OPENCV_AVAILABLE:
+                    self.background_type = "video"
+                    self.video_path = single_path
+                    self.init_video_background(single_path)
+                else:
+                    self.background_type = "image"
+                    self.background_image = self.load_background_image(single_path)
+            else:
+                print(f"⚠️ Không tìm thấy file background: {custom_bg_path}")
+        else:
+            # Nếu không có custom_bg_path hoặc không tồn tại, thử ảnh mặc định
+            self.background_image = self.load_background_image(None)
+            if self.background_image:
+                self.background_type = "image"
+            else:
+                self.background_type = None
+
         print("✅ Pygame Screen Protector đã khởi động thành công!")
         print(f"📱 Kích thước màn hình: {self.width}x{self.height}")
         if self.custom_message:
@@ -157,19 +251,228 @@ class PygameScreenProtector:
             print(f"🔑 Sử dụng mật khẩu tạm thời: {temp_password}")
         else:
             print(f"🔑 Sử dụng mật khẩu mặc định: {self.correct_password}")
-        
+        if custom_bg_path:
+            print(f"🖼️  Sử dụng background tạm thời: {custom_bg_path}")
+        if self.background_type == "video":
+            print(f"🎬 Đang sử dụng video làm background: {self.video_path}")
+        elif self.background_type == "image":
+            print(f"🖼️  Đang sử dụng ảnh làm background.")
+        elif self.monitor_assets:
+            print(f"🖥️  Đang sử dụng nền per-monitor: {len(self.active_monitors)} màn hình (đang khoá {'màn hình ' + str(self.target_screen) if self.target_screen else 'tất cả'})")
+        else:
+            print(f"🌈 Sử dụng gradient background.")
+
+    def get_virtual_desktop_rect(self):
+        """Lấy toạ độ và kích thước virtual desktop (bao gồm tất cả màn hình)."""
+        try:
+            # Chỉ số System Metrics cho virtual screen trên Windows
+            SM_XVIRTUALSCREEN = 76
+            SM_YVIRTUALSCREEN = 77
+            SM_CXVIRTUALSCREEN = 78
+            SM_CYVIRTUALSCREEN = 79
+            vx = win32api.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            vy = win32api.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            vw = win32api.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            vh = win32api.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            return vx, vy, vw, vh
+        except Exception:
+            # Fallback: dùng kích thước màn hình hiện tại
+            info = pygame.display.Info()
+            return 0, 0, info.current_w, info.current_h
+
+    def set_window_topmost_and_place(self, x, y, w, h):
+        """Đặt cửa sổ luôn-on-top và đúng vị trí virtual desktop."""
+        try:
+            hwnd = pygame.display.get_wm_info().get('window')
+            if hwnd:
+                HWND_TOPMOST = -1
+                SWP_SHOWWINDOW = 0x0040
+                ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, int(x), int(y), int(w), int(h), SWP_SHOWWINDOW)
+        except Exception:
+            pass
+
     def set_window_transparency(self):
         """Thiết lập transparency cho cửa sổ Pygame"""
         # Không cần thiết lập transparency cho toàn bộ cửa sổ
         # Chỉ UI elements sẽ có transparency
         pass
-    
-    def load_background_image(self):
-        """Tải background image"""
+
+    def hide_from_taskbar(self):
+        """Ẩn cửa sổ khỏi taskbar (và Alt+Tab) bằng cách chỉnh extended window styles."""
         try:
-            # Sử dụng resource_path để lấy đúng đường dẫn khi build exe
-            img_path = resource_path("wallpaper.jpg")
-            if os.path.exists(img_path):
+            hwnd = pygame.display.get_wm_info().get('window')
+            if not hwnd:
+                return
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            exstyle = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            exstyle = (exstyle | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle)
+            # Áp dụng thay đổi khung
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_FRAMECHANGED = 0x0020
+            SWP_SHOWWINDOW = 0x0040
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                              SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW)
+        except Exception:
+            pass
+
+    def enumerate_monitors(self, vx, vy, vw, vh):
+        """Trả về danh sách các màn hình với rect tương đối (x,y,w,h) so với virtual desktop."""
+        monitors = []
+        try:
+            user32 = ctypes.windll.user32
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+            MonitorEnumProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.POINTER(RECT), ctypes.c_double)
+            def _callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+                r = lprcMonitor.contents
+                mx, my, mw, mh = r.left, r.top, r.right - r.left, r.bottom - r.top
+                monitors.append({
+                    "abs": (mx, my, mw, mh),
+                    "rel": (mx - vx, my - vy, mw, mh)
+                })
+                return 1
+            MonitorEnumProc_cb = MonitorEnumProc(_callback)
+            user32.EnumDisplayMonitors(0, 0, MonitorEnumProc_cb, 0)
+            if not monitors:
+                raise RuntimeError("No monitors enumerated")
+        except Exception:
+            monitors = [{"abs": (vx, vy, vw, vh), "rel": (0, 0, vw, vh)}]
+        return monitors
+
+    def init_per_monitor_backgrounds(self, bg_list):
+        """Khởi tạo tài nguyên nền cho từng monitor theo danh sách đường dẫn."""
+        self.monitor_assets = []
+        for idx, mon in enumerate(self.monitors):
+            path = bg_list[idx % len(bg_list)]
+            asset = {"type": None, "image": None, "video_cap": None, "video_frame": None, "fps": 30, "last_time": 0.0, "path": path}
+            if os.path.exists(path):
+                ext = os.path.splitext(path)[1].lower()
+                if ext in [".mp4", ".avi", ".mov", ".mkv", ".wmv"] and OPENCV_AVAILABLE:
+                    try:
+                        cap = cv2.VideoCapture(path)
+                        if cap.isOpened():
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            asset["type"], asset["video_cap"], asset["fps"] = "video", cap, fps if fps and fps > 1 else 30
+                        else:
+                            cap.release()
+                    except Exception:
+                        pass
+                if asset["type"] is None:
+                    # Fallback image
+                    try:
+                        _, _, mw, mh = mon["rel"]
+                        pil_image = Image.open(path)
+                        pil_image = pil_image.resize((int(mw), int(mh)), Image.Resampling.LANCZOS)
+                        mode = pil_image.mode
+                        size = pil_image.size
+                        data = pil_image.tobytes()
+                        asset["image"] = pygame.image.fromstring(data, size, mode)
+                        asset["type"] = "image"
+                    except Exception:
+                        asset["type"] = None
+            self.monitor_assets.append(asset)
+
+    def get_next_video_frame_for(self, asset, mw, mh):
+        """Đọc frame tiếp theo từ asset video, resize theo (mw,mh), trả về surface hoặc None."""
+        cap = asset.get("video_cap")
+        if not cap:
+            return None
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            if not ret:
+                return None
+        frame = cv2.resize(frame, (int(mw), int(mh)))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return pygame.surfarray.make_surface(frame.swapaxes(0, 1))
+
+    def draw_clock_at(self, center_x, center_y):
+        """Vẽ một khối đồng hồ + ngày + message tại vị trí center chỉ định."""
+        glass_width = 500
+        glass_height = 250
+        clock_glass = self.create_glass_effect(0, 0, glass_width, glass_height, 40, (255, 255, 255))
+        clock_rect = clock_glass.get_rect(center=(int(center_x), int(center_y)))
+        current_time = time.strftime("%H:%M")
+        current_date = time.strftime("%A, %B %d")
+        max_time_width = int(glass_width * 0.9)
+        max_time_height = int(glass_height * 0.4)
+        time_surface, _ = self._render_text_fit(self.clock_font, current_time, max_time_width, self.WHITE, min_font_size=36, max_height=max_time_height)
+        time_rect = time_surface.get_rect(center=(glass_width//2, 100))
+        max_date_width = int(glass_width * 0.9)
+        max_date_height = int(glass_height * 0.2)
+        date_surface, _ = self._render_text_fit(self.date_font, current_date, max_date_width, self.WHITE, min_font_size=20, max_height=max_date_height)
+        date_rect = date_surface.get_rect(center=(glass_width//2, 170))
+        clock_glass.blit(time_surface, time_rect)
+        clock_glass.blit(date_surface, date_rect)
+        if self.custom_message:
+            max_msg_width = int(glass_width * 0.9)
+            max_msg_height = int(glass_height * 0.2)
+            msg_surface, _ = self._render_text_fit(self.message_font, self.custom_message, max_msg_width, self.WHITE, min_font_size=16, max_height=max_msg_height)
+            msg_rect = msg_surface.get_rect(center=(glass_width//2, 220))
+            clock_glass.blit(msg_surface, msg_rect)
+        self.ui_surface.blit(clock_glass, clock_rect)
+
+    def init_video_background(self, video_path):
+        """Khởi tạo video background"""
+        try:
+            self.video_cap = cv2.VideoCapture(video_path)
+            if not self.video_cap.isOpened():
+                print(f"❌ Không thể mở video: {video_path}")
+                self.background_type = None
+                self.video_cap = None
+                return
+            # Lấy fps của video
+            fps = self.video_cap.get(cv2.CAP_PROP_FPS)
+            if fps and fps > 1:
+                self.video_fps = fps
+            else:
+                self.video_fps = 30
+            print(f"🎬 Đã mở video background: {video_path} (fps={self.video_fps})")
+        except Exception as e:
+            print(f"❌ Lỗi khi mở video background: {e}")
+            self.background_type = None
+            self.video_cap = None
+
+    def get_next_video_frame(self):
+        """Lấy frame tiếp theo từ video, trả về pygame.Surface hoặc None"""
+        if not self.video_cap:
+            return None
+        ret, frame = self.video_cap.read()
+        if not ret:
+            # Nếu hết video, tua lại từ đầu
+            self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.video_cap.read()
+            if not ret:
+                return None
+        # Resize frame về kích thước màn hình
+        frame = cv2.resize(frame, (self.width, self.height))
+        # Chuyển BGR -> RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Tạo surface từ numpy array
+        surf = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
+        return surf
+
+    def load_background_image(self, custom_bg_path=None):
+        """Tải background image, ưu tiên custom_bg_path nếu có"""
+        try:
+            img_path = None
+            if custom_bg_path:
+                if os.path.exists(custom_bg_path):
+                    img_path = custom_bg_path
+                else:
+                    print(f"⚠️ Không tìm thấy file background tạm thời: {custom_bg_path}")
+            if not img_path:
+                # Tìm ảnh mặc định ở nhiều vị trí (hỗ trợ PyInstaller)
+                default_path = find_default_wallpaper_path()
+                if default_path:
+                    img_path = default_path
+            if img_path:
                 # Tải và resize image
                 pil_image = Image.open(img_path)
                 pil_image = pil_image.resize((self.width, self.height), Image.Resampling.LANCZOS)
@@ -183,12 +486,12 @@ class PygameScreenProtector:
                 print(f"✅ Đã tải background image: {img_path}")
                 return pygame_image
             else:
-                print(f"⚠️ Không tìm thấy {img_path}, sử dụng gradient")
+                print(f"⚠️ Không tìm thấy background image, sử dụng gradient")
                 return None
         except Exception as e:
             print(f"❌ Lỗi tải background: {e}")
             return None
-    
+
     def create_gradient_background(self):
         """Tạo gradient background đẹp"""
         gradient_surface = pygame.Surface((self.width, self.height))
@@ -207,7 +510,7 @@ class PygameScreenProtector:
             pygame.draw.line(gradient_surface, (r, g, b), (0, y), (self.width, y))
         
         return gradient_surface
-    
+
     def create_glass_effect(self, x, y, width, height, alpha=100, color=(255, 255, 255)):
         """Tạo hiệu ứng glass morphism với transparency thực sự"""
         glass_surface = pygame.Surface((width, height), pygame.SRCALPHA)
@@ -367,8 +670,56 @@ class PygameScreenProtector:
             elif self.clock_y > self.clock_y_target:
                 self.clock_y = max(self.clock_y - self.clock_move_speed, self.clock_y_target)
             
-            # Vẽ background
-            if self.background_image:
+            # Vẽ background (per-monitor nếu có), sau đó UI per-monitor
+            if self.monitor_assets:
+                for idx, mon in enumerate(self.active_monitors):
+                    rx, ry, mw, mh = mon["rel"]
+                    # Khi chỉ khoá một màn hình, toạ độ rel phải quy đổi về (0,0) trong cửa sổ
+                    if len(self.active_monitors) == 1:
+                        rx, ry = 0, 0
+                    asset = self.monitor_assets[idx] if idx < len(self.monitor_assets) else None
+                    if asset and asset.get("type") == "video" and asset.get("video_cap"):
+                        now = time.time()
+                        interval = 1.0 / asset.get("fps", 30)
+                        if now - asset.get("last_time", 0) >= interval:
+                            asset["video_frame"] = self.get_next_video_frame_for(asset, mw, mh)
+                            asset["last_time"] = now
+                        if asset.get("video_frame") is not None:
+                            self.screen.blit(asset["video_frame"], (int(rx), int(ry)))
+                        else:
+                            pygame.draw.rect(self.screen, (0, 0, 0), pygame.Rect(int(rx), int(ry), int(mw), int(mh)))
+                    elif asset and asset.get("type") == "image" and asset.get("image"):
+                        self.screen.blit(asset["image"], (int(rx), int(ry)))
+                    else:
+                        # Gradient fill region
+                        sub_surface = pygame.Surface((int(mw), int(mh)))
+                        # Simple vertical gradient in region
+                        for y in range(int(mh)):
+                            ratio = y / max(1, mh)
+                            if ratio < 0.5:
+                                r = int(135 + (200 - 135) * (ratio * 2))
+                                g = int(206 + (230 - 206) * (ratio * 2))
+                                b = int(235 + (255 - 235) * (ratio * 2))
+                            else:
+                                r = int(0 + (25 - 0) * ((ratio - 0.5) * 2))
+                                g = int(25 + (50 - 25) * ((ratio - 0.5) * 2))
+                                b = int(100 + (150 - 100) * ((ratio - 0.5) * 2))
+                            pygame.draw.line(sub_surface, (r, g, b), (0, y), (int(mw), y))
+                        self.screen.blit(sub_surface, (int(rx), int(ry)))
+            elif self.background_type == "video" and self.video_cap:
+                # Tính toán thời gian để lấy frame tiếp theo
+                now = time.time()
+                interval = 1.0 / self.video_fps if self.video_fps > 0 else 1.0 / 30
+                if now - self.video_last_time >= interval:
+                    self.video_frame = self.get_next_video_frame()
+                    self.video_last_time = now
+                if self.video_frame is not None:
+                    self.screen.blit(self.video_frame, (0, 0))
+                else:
+                    # Nếu không lấy được frame, dùng gradient
+                    gradient = self.create_gradient_background()
+                    self.screen.blit(gradient, (0, 0))
+            elif self.background_type == "image" and self.background_image:
                 self.screen.blit(self.background_image, (0, 0))
             else:
                 gradient = self.create_gradient_background()
@@ -378,7 +729,23 @@ class PygameScreenProtector:
             self.draw_fade_overlay()
             
             # Vẽ UI với transparency
-            self.draw_clock()
+            self.ui_surface.fill(self.TRANSPARENT)
+            if self.monitor_assets:
+                # Một clock giữa mỗi monitor
+                for mon in self.active_monitors:
+                    rx, ry, mw, mh = mon["rel"]
+                    if len(self.active_monitors) == 1:
+                        rx, ry = 0, 0
+                    center_x = rx + mw // 2
+                    center_y = ry + (self.clock_y - (self.height // 2 - 100))  # giữ chuyển động đồng bộ theo self.clock_y
+                    # Clamp center_y vào vùng monitor
+                    center_y = max(ry + 100, min(ry + mh - 100, center_y))
+                    # Chỉ hiển thị đồng hồ/ô nhập trên màn hình 1 khi không chỉ định -scr
+                    if (self.target_screen is None and mon is self.active_monitors[0]) or (self.target_screen is not None):
+                        self.draw_clock_at(center_x, center_y)
+                    # Nếu không, bỏ qua clock ở các màn khác
+            else:
+                self.draw_clock()
             self.screen.blit(self.ui_surface, (0, 0))
             
             pygame.display.flip()
@@ -386,6 +753,9 @@ class PygameScreenProtector:
         
         # Thoát mượt mà
         print("🔄 Đang đóng Pygame...")
+        # Giải phóng video nếu có
+        if self.video_cap:
+            self.video_cap.release()
         pygame.quit()
         print("✅ Ứng dụng đã thoát thành công!")
         # Không gọi sys.exit() để tránh "refresh" màn hình
@@ -695,6 +1065,10 @@ def main():
                        help='Custom message to display below the clock')
     parser.add_argument('-pw', '--password', type=str, default=None,
                        help='Temporary password to unlock the screen (default: 123456)')
+    parser.add_argument('-bg', '--background', type=str, default=None,
+                       help='Đường dẫn file ảnh hoặc video background tạm thời cho lần khóa này (hỗ trợ .mp4, .avi, .mov, .mkv, .wmv)')
+    parser.add_argument('-scr', '--screen', type=int, default=None,
+                       help='Chỉ khoá một màn hình (1-based). Bỏ qua để khoá tất cả.')
     args = parser.parse_args()
     
     print("🚀 Khởi động Pygame Screen Protector...")
@@ -708,10 +1082,18 @@ def main():
         print(f"🔑 Sử dụng mật khẩu tạm thời: {args.password}")
     else:
         print(f"🔑 Sử dụng mật khẩu mặc định: 123456")
+    if args.background:
+        print(f"🖼️  Sử dụng background tạm thời: {args.background}")
+        ext = os.path.splitext(args.background)[1].lower()
+        if ext in [".mp4", ".avi", ".mov", ".mkv", ".wmv"]:
+            if not OPENCV_AVAILABLE:
+                print("⚠️  Bạn cần cài đặt opencv-python để sử dụng video làm background: pip install opencv-python")
+            else:
+                print("🎬 Sử dụng video làm background (beta)")
     print("=" * 50)
     
     try:
-        app = PygameScreenProtector(args.message, args.password)
+        app = PygameScreenProtector(args.message, args.password, args.background, args.screen)
         app.run()
     except Exception as e:
         print(f"❌ Lỗi khởi động ứng dụng: {e}")
