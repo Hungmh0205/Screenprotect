@@ -112,7 +112,7 @@ def find_vietnamese_font(preferred_fonts=None):
     return None
 
 class PygameScreenProtector:
-    def __init__(self, custom_message="", temp_password=None, custom_bg_path=None, target_screen=None):
+    def __init__(self, custom_message="", temp_password=None, custom_bg_path=None, target_screen=None, clock_screen=None):
         pygame.init()
         
         # Thiết lập cửa sổ không viền phủ toàn bộ virtual desktop (tất cả màn hình)
@@ -120,13 +120,21 @@ class PygameScreenProtector:
         # Danh sách monitor với toạ độ tương đối trong virtual desktop
         self.monitors = self.enumerate_monitors(vx, vy, vw, vh)
         self.target_screen = target_screen  # 1-based index từ tham số dòng lệnh
-        # Xác định phạm vi cửa sổ theo lựa chọn -scr
+        self.clock_screen = clock_screen  # 1-based index cho vị trí hiển thị clock
+        # Xác định phạm vi cửa sổ theo lựa chọn -scr hoặc -clock
         if isinstance(self.target_screen, int) and 1 <= self.target_screen <= len(self.monitors):
+            # -scr flag: chỉ khóa một màn hình
             sel = self.monitors[self.target_screen - 1]
             win_x, win_y, win_w, win_h = sel["abs"]
             window_rel_x, window_rel_y = sel["rel"][0], sel["rel"][1]
             self.active_monitors = [sel]
+        elif isinstance(self.clock_screen, int) and 1 <= self.clock_screen <= len(self.monitors):
+            # -clock flag: khóa tất cả màn hình nhưng chỉ hiển thị UI trên màn hình được chọn
+            win_x, win_y, win_w, win_h = vx, vy, vw, vh
+            window_rel_x, window_rel_y = 0, 0
+            self.active_monitors = self.monitors
         else:
+            # Mặc định: khóa tất cả màn hình
             win_x, win_y, win_w, win_h = vx, vy, vw, vh
             window_rel_x, window_rel_y = 0, 0
             self.active_monitors = self.monitors
@@ -243,8 +251,27 @@ class PygameScreenProtector:
             else:
                 self.background_type = None
 
+        # Validate clock screen if specified
+        if self.clock_screen is not None:
+            if self.clock_screen < 1 or self.clock_screen > len(self.monitors):
+                print(f"❌ Lỗi: Số màn hình clock ({self.clock_screen}) không hợp lệ. Có {len(self.monitors)} màn hình.")
+                sys.exit(1)
+            
+            # Hiển thị thông tin chi tiết về màn hình được chọn
+            target_monitor = self.monitors[self.clock_screen - 1]
+            abs_x, abs_y, abs_w, abs_h = target_monitor["abs"]
+            center_x = abs_x + abs_w // 2
+            center_y = abs_y + abs_h // 2
+            print(f"🕐 Đồng hồ sẽ hiển thị trên màn hình {self.clock_screen}")
+            print(f"   Màn hình {self.clock_screen}: {abs_w}x{abs_h} tại vị trí ({abs_x},{abs_y})")
+            print(f"   Vị trí center: ({center_x}, {center_y})")
+        
         print("✅ Pygame Screen Protector đã khởi động thành công!")
-        print(f"📱 Kích thước màn hình: {self.width}x{self.height}")
+        print(f"📱 Kích thước cửa sổ: {self.width}x{self.height}")
+        print(f"🖥️  Phát hiện {len(self.monitors)} màn hình:")
+        for i, mon in enumerate(self.monitors):
+            abs_x, abs_y, abs_w, abs_h = mon["abs"]
+            print(f"   Màn hình {i+1}: {abs_w}x{abs_h} tại vị trí ({abs_x},{abs_y})")
         if self.custom_message:
             print(f"💬 Custom message: {self.custom_message}")
         if temp_password:
@@ -601,10 +628,6 @@ class PygameScreenProtector:
         
         # Vẽ glass lên UI surface
         self.ui_surface.blit(clock_glass, clock_rect)
-        
-        # Vẽ password field nếu cần
-        if self.show_password or self.fade_alpha > 0:
-            self.draw_password_field()
     
     def draw_password_field(self):
         """Vẽ ô mật khẩu với nền trong suốt"""
@@ -613,6 +636,24 @@ class PygameScreenProtector:
         pw_height = 60
         pw_glass = self.create_glass_effect(0, 0, pw_width, pw_height, 80, (0, 0, 0))
         pw_rect = pw_glass.get_rect(center=(self.width//2, self.height//2 + 150))
+        
+        # Vẽ password (dấu *)
+        password_display = "*" * len(self.password)
+        # Font nhỏ hơn cho phù hợp với ô nhỏ
+        pw_text = self.password_font.render(password_display, True, self.WHITE)
+        pw_text_rect = pw_text.get_rect(center=(pw_width//2, pw_height//2))
+        pw_glass.blit(pw_text, pw_text_rect)
+        
+        # Vẽ glass lên UI surface
+        self.ui_surface.blit(pw_glass, pw_rect)
+    
+    def draw_password_field_at(self, center_x, center_y):
+        """Vẽ ô mật khẩu tại vị trí center chỉ định"""
+        # Kích thước nhỏ hơn, giống màn hình lock của Windows
+        pw_width = 280
+        pw_height = 60
+        pw_glass = self.create_glass_effect(0, 0, pw_width, pw_height, 80, (0, 0, 0))
+        pw_rect = pw_glass.get_rect(center=(int(center_x), int(center_y)))
         
         # Vẽ password (dấu *)
         password_display = "*" * len(self.password)
@@ -732,20 +773,75 @@ class PygameScreenProtector:
             self.ui_surface.fill(self.TRANSPARENT)
             if self.monitor_assets:
                 # Một clock giữa mỗi monitor
-                for mon in self.active_monitors:
+                for idx, mon in enumerate(self.active_monitors):
                     rx, ry, mw, mh = mon["rel"]
                     if len(self.active_monitors) == 1:
                         rx, ry = 0, 0
-                    center_x = rx + mw // 2
-                    center_y = ry + (self.clock_y - (self.height // 2 - 100))  # giữ chuyển động đồng bộ theo self.clock_y
-                    # Clamp center_y vào vùng monitor
-                    center_y = max(ry + 100, min(ry + mh - 100, center_y))
-                    # Chỉ hiển thị đồng hồ/ô nhập trên màn hình 1 khi không chỉ định -scr
-                    if (self.target_screen is None and mon is self.active_monitors[0]) or (self.target_screen is not None):
-                        self.draw_clock_at(center_x, center_y)
-                    # Nếu không, bỏ qua clock ở các màn khác
+                    
+                    # Logic hiển thị clock dựa trên các flag
+                    should_show_clock = False
+                    if self.clock_screen is not None:
+                        # Nếu có -clock flag, hiển thị clock trên màn hình được chỉ định
+                        if self.clock_screen == idx + 1:  # Convert to 1-based index
+                            should_show_clock = True
+                    elif self.target_screen is not None:
+                        # Nếu có -scr flag, hiển thị clock trên màn hình được chọn
+                        if self.target_screen == idx + 1:  # Convert to 1-based index
+                            should_show_clock = True
+                    else:
+                        # Mặc định: hiển thị clock trên màn hình đầu tiên
+                        if idx == 0:
+                            should_show_clock = True
+                    
+                    if should_show_clock:
+                        # Tính toán vị trí center chính xác cho màn hình này
+                        # Sử dụng tọa độ tuyệt đối của màn hình để tính center chính xác
+                        abs_x, abs_y, abs_w, abs_h = mon["abs"]
+                        center_x = abs_x + abs_w // 2
+                        
+                        if self.clock_screen is not None:
+                            # Khi dùng -clock, tính center_y dựa trên màn hình được chọn
+                            center_y = abs_y + abs_h // 2 - 100  # Giữa màn hình, hơi lên trên
+                        else:
+                            # Logic cũ cho các trường hợp khác
+                            center_y = abs_y + (self.clock_y - (self.height // 2 - 100))
+                            center_y = max(abs_y + 100, min(abs_y + abs_h - 100, center_y))
+                        
+                        # Chuyển đổi từ tọa độ tuyệt đối về tọa độ tương đối trong cửa sổ
+                        window_center_x = center_x - self.window_vx
+                        window_center_y = center_y - self.window_vy
+                        
+                        self.draw_clock_at(window_center_x, window_center_y)
+                        
+                        # Vẽ password field nếu cần (chỉ trên màn hình hiển thị clock)
+                        if self.show_password or self.fade_alpha > 0:
+                            self.draw_password_field_at(window_center_x, window_center_y + 200)  # Dưới clock 200px
             else:
-                self.draw_clock()
+                # Trường hợp không có monitor_assets, vẫn cần hỗ trợ -clock flag
+                if self.clock_screen is not None and 1 <= self.clock_screen <= len(self.monitors):
+                    # Hiển thị clock trên màn hình được chọn
+                    target_monitor = self.monitors[self.clock_screen - 1]
+                    abs_x, abs_y, abs_w, abs_h = target_monitor["abs"]
+                    
+                    # Tính center chính xác dựa trên tọa độ tuyệt đối
+                    center_x = abs_x + abs_w // 2
+                    center_y = abs_y + abs_h // 2 - 100  # Giữa màn hình, hơi lên trên
+                    
+                    # Chuyển đổi từ tọa độ tuyệt đối về tọa độ tương đối trong cửa sổ
+                    window_center_x = center_x - self.window_vx
+                    window_center_y = center_y - self.window_vy
+                    
+                    self.draw_clock_at(window_center_x, window_center_y)
+                    
+                    # Vẽ password field nếu cần
+                    if self.show_password or self.fade_alpha > 0:
+                        self.draw_password_field_at(window_center_x, window_center_y + 200)  # Dưới clock 200px
+                else:
+                    # Logic cũ cho trường hợp mặc định
+                    self.draw_clock()
+                    # Vẽ password field nếu cần (cho trường hợp mặc định)
+                    if self.show_password or self.fade_alpha > 0:
+                        self.draw_password_field()
             self.screen.blit(self.ui_surface, (0, 0))
             
             pygame.display.flip()
@@ -1069,7 +1165,14 @@ def main():
                        help='Đường dẫn file ảnh hoặc video background tạm thời cho lần khóa này (hỗ trợ .mp4, .avi, .mov, .mkv, .wmv)')
     parser.add_argument('-scr', '--screen', type=int, default=None,
                        help='Chỉ khoá một màn hình (1-based). Bỏ qua để khoá tất cả.')
+    parser.add_argument('-clock', '--clock', type=int, default=None,
+                       help='Hiển thị đồng hồ và ô nhập mật khẩu ở màn hình được chọn (1-based). Khóa tất cả màn hình nhưng chỉ hiển thị UI trên màn hình được chọn.')
     args = parser.parse_args()
+    
+    # Validate clock screen parameter
+    if args.clock is not None and args.clock < 1:
+        print("❌ Lỗi: Số màn hình phải >= 1")
+        sys.exit(1)
     
     print("🚀 Khởi động Pygame Screen Protector...")
     print("🔑 Mật khẩu mặc định: 123456")
@@ -1090,10 +1193,12 @@ def main():
                 print("⚠️  Bạn cần cài đặt opencv-python để sử dụng video làm background: pip install opencv-python")
             else:
                 print("🎬 Sử dụng video làm background (beta)")
+    if args.clock:
+        print(f"🕐 Hiển thị đồng hồ trên màn hình: {args.clock}")
     print("=" * 50)
     
     try:
-        app = PygameScreenProtector(args.message, args.password, args.background, args.screen)
+        app = PygameScreenProtector(args.message, args.password, args.background, args.screen, args.clock)
         app.run()
     except Exception as e:
         print(f"❌ Lỗi khởi động ứng dụng: {e}")
